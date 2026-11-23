@@ -1,0 +1,179 @@
+name: Big Sur test build
+
+# The Intel macOS build lowered to macOS 11.3, the oldest the Flutter engine's
+# imports allow (NSConstantIntegerNumber, Swift 5.4 runtime). Tag: legacy-vX.Y.Z[-pre.N].
+on:
+  push:
+    branches: [big-sur-flutter-startup]
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: '3.50.0'
+  MIN_MACOS: '11.3'
+
+jobs:
+  build:
+    runs-on: macos-26-intel
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.3'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Stock Go 1.25+ links for macOS 12; MetaCubeX's build reverts that, as
+      # mihomo's own darwin releases do.
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-download-base-url: 'https://github.com/MetaCubeX/go/releases/download/build'
+          go-version: '1.26'
+          cache-dependency-path: core/go.sum
+
+      # Uncached: the SDK is patched below, and the regular Intel build shares
+      # the cache key.
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: false
+
+      - name: Setup Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.3.app || sudo xcode-select -s /Applications/Xcode_26.2.app
+          xcodebuild -version
+
+      - name: Lower Flutter's macOS minimum to 11.3
+        run: |
+          tools="$FLUTTER_ROOT/packages/flutter_tools"
+          lower() {
+            sed -i '' "s/$2/$3/" "$tools/$1"
+            grep -q "$3" "$tools/$1" || { echo "$1 no longer holds $2"; exit 1; }
+          }
+          lower lib/src/darwin/darwin.dart 'macos => Version(12, 0, null)' 'macos => Version(11, 3, null)'
+          lower lib/src/isolated/native_assets/macos/native_assets.dart 'targetMacOSVersion = 13;' 'targetMacOSVersion = 11;'
+          rm -f "$FLUTTER_ROOT/bin/cache/flutter_tools.snapshot" "$FLUTTER_ROOT/bin/cache/flutter_tools.stamp"
+          flutter precache --macos
+          sed -i '' 's/MACOSX_DEPLOYMENT_TARGET = 12.0;/MACOSX_DEPLOYMENT_TARGET = 11.3;/' macos/Runner.xcodeproj/project.pbxproj
+          ! grep -q 'MACOSX_DEPLOYMENT_TARGET = 12' macos/Runner.xcodeproj/project.pbxproj
+
+      # The engine is built for macOS 12 but imports nothing newer than 11.3.
+      - name: Lower the engine's minimum to 11.3
+        run: |
+          found=0
+          while IFS= read -r -d '' binary; do
+            sdk=$(vtool -arch x86_64 -show-build "$binary" | awk '$1 == "sdk" {print $2; exit}')
+            vtool -set-build-version macos "$MIN_MACOS" "$sdk" -replace -output "$binary.lowered" "$binary"
+            mv "$binary.lowered" "$binary"
+            codesign --force --sign - --preserve-metadata=identifier "$binary"
+            found=$((found + 1))
+          done < <(find "$FLUTTER_ROOT/bin/cache/artifacts/engine" -path '*/FlutterMacOS.framework/Versions/A/FlutterMacOS' -type f -print0)
+          [ "$found" -gt 0 ] || { echo 'no FlutterMacOS in the engine cache'; exit 1; }
+
+      # sqlite3's prebuilt library targets macOS 13; its own release built here does not.
+      - name: Build SQLite from source
+        env:
+          SQLITE: sqlite-amalgamation-3530400
+          SQLITE_SHA256: 1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/sqlite.zip" "https://sqlite.org/2026/$SQLITE.zip"
+          echo "$SQLITE_SHA256  $RUNNER_TEMP/sqlite.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/sqlite.zip" -d build
+          perl -0pi -e 's/^  user_defines:\n/  user_defines:\n    sqlite3:\n      source: source\n      path: build\/$ENV{SQLITE}\/sqlite3.c\n/m' pubspec.yaml
+          grep -q "path: build/$SQLITE/sqlite3.c" pubspec.yaml
+
+      - name: Get Flutter dependency
+        run: |
+          flutter --version
+          go version
+          flutter pub get
+
+      - name: Disable Impeller on Intel macOS
+        run: plutil -replace FLTEnableImpeller -bool NO macos/Runner/Info.plist
+
+      - name: Fetch CA certificates
+        env:
+          CA_BUNDLE: cacert-2026-10-20.pem
+          CA_BUNDLE_SHA256: 796f1389bfea13c0ed78f663b765baaff54a508e5483786bd6ece73c5e3e3cbe
+        run: |
+          bundle=assets/ca/ca-certificates.crt
+          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
+          echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
+
+      - name: Build FlClashX
+        run: |
+          npm install -g create-dmg
+          dart setup.dart macos --env stable -v
+
+      - name: Apply Big Sur runtime compatibility changes
+        run: |
+          app=build/macos/Build/Products/Release/FlClashX.app
+          engine="$app/Contents/Frameworks/FlutterMacOS.framework/Versions/A/FlutterMacOS"
+          python3 - "$engine" <<'PYTHON'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          data = path.read_bytes()
+          for original, updated in (
+              (bytes.fromhex("81 f9 bf d4 01 00 7e 1c"), bytes.fromhex("81 f9 af ad 01 00 7e 1c")),
+              (bytes.fromhex("48 8d 3d ba 51 22 00 b9 0c 00 00 00 45 31 c0"), bytes.fromhex("48 8d 3d ba 51 22 00 b9 0b 00 00 00 45 31 c0")),
+          ):
+              if data.count(original) != 1:
+                  raise SystemExit("Unexpected Flutter engine layout")
+              data = data.replace(original, updated)
+          path.write_bytes(data)
+          PYTHON
+          snapshots="$app/Contents/Frameworks/App.framework"
+          python3 tool/big_sur_snapshot.py "$snapshots/Versions/A/App"
+          codesign --force --sign - "$app/Contents/Frameworks/FlutterMacOS.framework"
+          codesign --force --sign - "$snapshots"
+          codesign --force --sign - --preserve-metadata=entitlements "$app"
+          codesign --verify --deep --strict "$app"
+          python3 - "$snapshots/Versions/A/App" <<'PYTHON'
+          from ctypes import CDLL
+          import sys
+          dylib = CDLL(sys.argv[1])
+          for symbol in ("kDartSnapshotText", "kDartSnapshotData"):
+              getattr(dylib, symbol)
+          PYTHON
+
+      - name: Check every binary runs on macOS ${{ env.MIN_MACOS }}
+        run: |
+          app=build/macos/Build/Products/Release/FlClashX.app
+          [ -d "$app" ] || { echo "$app was not built"; exit 1; }
+          checked=0
+          failed=0
+          while IFS= read -r -d '' file; do
+            file -b "$file" | grep -q 'Mach-O' || continue
+            info=$(vtool -arch x86_64 -show-build "$file" 2>&1) || {
+              echo "vtool failed on ${file#$app/}: $info"; failed=1; continue; }
+            minos=$(awk '$1 == "minos" || $1 == "version" {print $2; exit}' <<< "$info")
+            if [ -z "$minos" ]; then
+              echo "no minimum macOS in ${file#$app/}"; failed=1; continue
+            fi
+            checked=$((checked + 1))
+            echo "$minos  ${file#$app/}"
+            if [ "$(printf '%s\n%s\n' "$minos" "$MIN_MACOS" | sort -V | tail -1)" != "$MIN_MACOS" ]; then
+              failed=1
+            fi
+          done < <(find "$app" -type f -print0)
+          plist_min=$(plutil -extract LSMinimumSystemVersion raw "$app/Contents/Info.plist")
+          echo "LSMinimumSystemVersion $plist_min"
+          [ "$plist_min" = "$MIN_MACOS" ] || failed=1
+          if [ "$checked" = 0 ] || [ "$failed" = 1 ]; then
+            echo "not every binary runs on macOS $MIN_MACOS (checked $checked)"
+            exit 1
+          fi
+
+      - name: Package test build
+        run: |
+          ditto -c -k --keepParent build/macos/Build/Products/Release/FlClashX.app FlClashX-Big-Sur-Intel.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FlClashX-Big-Sur-Intel
+          path: FlClashX-Big-Sur-Intel.zip
+          if-no-files-found: error
